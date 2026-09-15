@@ -247,9 +247,11 @@ async def main(argv: Sequence[str]) -> None:
     )
     server_pb2_grpc.add_SimplyServiceServicer_to_server(service, server)
 
+    # The service descriptors by name: the open-source protobuf gencode emits
+    # no `Health` / `SimplyService` module attributes.
     service_names = (
-        health_pb2.Health.DESCRIPTOR.full_name,
-        server_pb2.SimplyService.DESCRIPTOR.full_name,
+        health_pb2.DESCRIPTOR.services_by_name['Health'].full_name,
+        server_pb2.DESCRIPTOR.services_by_name['SimplyService'].full_name,
         reflection.SERVICE_NAME,
     )
     reflection.enable_server_reflection(service_names, server)
