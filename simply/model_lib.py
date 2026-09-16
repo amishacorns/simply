@@ -773,8 +773,17 @@ class MoEFeedForward(FeedForward):
   # dropping: maximum token processed per expert shard
   # dropless: maximum tokens processed per expert shard before slowpath fallback
   ep_capacity_factor: float | None = None
-  ep_method: Literal['dense', 'ra2a', 'pipelined_ag', 'pipelined_ra2a'
-                     ] = 'ra2a'
+  # 'fused_ep': the whole layer through the fused expert-parallel kernel
+  # (simply/kernels/fused_ep_bridge.py), over the sharding config's
+  # expert-parallel axis. Inference only: the kernel has no gradient, and the
+  # path serves the fused gate|up weight that `quantize` builds after restore.
+  ep_method: Literal['dense', 'ra2a', 'pipelined_ag', 'pipelined_ra2a',
+                     'fused_ep'] = 'ra2a'
+  # With 'fused_ep': the kernel's row numerics, 'fp8' (its default) or 'bf16',
+  # and the column block an expert too large for VMEM streams in (0 = the
+  # whole-expert build, 512 fits every shape gated so far).
+  fused_ep_rows: Literal['fp8', 'bf16'] = 'fp8'
+  fused_ep_activation_block: int = 0
   ep_pipeline_stages: int = 4
   ep_pipeline_comms: Literal['xla', 'pallas'] = 'xla'
   ep_pipeline_fine_grained_ra2a: bool = False
@@ -850,6 +859,14 @@ class MoEFeedForward(FeedForward):
 
   def quantize(self, params: PyTree) -> PyTree:
     """Quantizes the FFN weights."""
+    if self.ep_method == 'fused_ep':
+      if self.weight_quant:
+        raise NotImplementedError(
+            'ep_method=fused_ep with weight_quant: the kernel takes int4'
+            ' weights with one scale per contraction block, which this'
+            ' quantizer does not produce yet.'
+        )
+      return self._fuse_gate_and_up(params)
     if not self.weight_quant:
       return params
     quant_dtype, block_size = quant_lib.parse_weight_quant(self.weight_quant)
@@ -921,6 +938,15 @@ class MoEFeedForward(FeedForward):
           selected_weights=selected_router_probs,
           inputs_mask=inputs_mask,
       )
+    elif self.ep_method == 'fused_ep':  # sparse dropless, one kernel program
+      logging.info('MoE method: fused expert-parallel kernel')
+      outputs, ffn_extra_output = self._apply_fused_ep(
+          params,
+          inputs,
+          selected_indices=selected_indices,
+          selected_weights=selected_router_probs,
+          inputs_mask=inputs_mask,
+      )
     elif self.ep_method == 'dense' and self.ep_capacity_factor is not None:
       # dense with dropping
       logging.info('MoE method: dense moe')
@@ -973,6 +999,115 @@ class MoEFeedForward(FeedForward):
         outputs, self.sharding_config.activation_partition  # pyrefly: ignore[bad-argument-type]
     )
     return outputs, extra_output
+
+  def _fuse_gate_and_up(self, params: PyTree) -> PyTree:
+    """The fused kernel's weight form: gate and up side by side.
+
+    `ffn_0_fused/w` is [num_experts, model_dim, 2 * expand_dim], the gate
+    half (the one the activation is applied to) first, then the up half.
+    Built once at load: the abstract target this produces drives the
+    checkpoint restore, which fuses the two stored weights into it
+    (checkpoint_lib.fuse_expert_gate_up), and the two originals are not
+    kept.
+    """
+    if 'ffn_0_fused' in params:
+      return params
+    if not self.use_gated_activation_in_ffn:
+      raise NotImplementedError(
+          'ep_method=fused_ep takes a gated FFN (gate and up projections).'
+      )
+    params = dict(params)  # pyrefly: ignore[no-matching-overload]
+    gate = common.get_raw_arrays(params.pop('ffn_0_gate')['w'])
+    up = common.get_raw_arrays(params.pop('ffn_0')['w'])
+    fused = jnp.concatenate([gate, up], axis=-1)
+    fused = sharding_lib.with_sharding_constraint(fused, self.ffn0_partition)
+    params['ffn_0_fused'] = {'w': fused}
+    return params
+
+  def _apply_fused_ep(
+      self,
+      params: PyTree,
+      inputs: Array,
+      selected_indices: Array,
+      selected_weights: Array,
+      inputs_mask: Array | None = None,
+  ) -> tuple[Array, PyTree]:
+    """The whole layer through the fused expert-parallel kernel.
+
+    The routing is this layer's own (top_k then softmax, in `apply`); the
+    kernel moves each token's rows to its experts' shards, runs the two
+    grouped matmuls with the gated activation there, and sums the weighted
+    results back on the token's own shard, as one program. Padded tokens
+    are routed to no expert, as `_apply_sparse_moe` routes them.
+    """
+    from simply.kernels import fused_ep_bridge  # pylint: disable=g-import-not-at-top
+
+    if 'ffn_0_fused' not in params:
+      raise ValueError(
+          "ep_method='fused_ep' serves the fused gate|up expert weight that"
+          ' quantize() builds after restore: call model.quantize(params)'
+          ' first. This path is inference-only; the kernel has no gradient.'
+      )
+    if inputs_mask is not None:
+      selected_indices = jnp.where(
+          inputs_mask[..., None], selected_indices, self.num_experts
+      )
+    ep_axis = get_partition_axis(self.ffn0_partition, axis=0)
+    if not isinstance(ep_axis, str):
+      raise ValueError(
+          "ep_method='fused_ep' splits the experts over one mesh axis; this"
+          f' sharding partitions them over {ep_axis!r}.'
+      )
+    # An expert count the axis does not divide is refused by JAX when the
+    # expert weights are placed, before this point.
+    mesh = js.get_abstract_mesh()
+    batch_size, seq_len, model_dim = inputs.shape
+    tokens = batch_size * seq_len
+    top_k = self.num_experts_per_token
+    row_partition = (ep_axis, None)
+    x = jnp.asarray(inputs, self.activation_dtype).reshape(tokens, model_dim)
+    x = sharding_lib.with_sharding_constraint(x, row_partition)
+    indices = selected_indices.reshape(tokens, top_k).astype(jnp.int32)
+    indices = sharding_lib.with_sharding_constraint(indices, row_partition)
+    # The router's probabilities stay float32 into the kernel, which combines
+    # in float32; rounding them to the activation dtype first would cost
+    # accuracy for nothing.
+    weights = jnp.asarray(selected_weights, jnp.float32).reshape(tokens, top_k)
+    weights = sharding_lib.with_sharding_constraint(weights, row_partition)
+    # ffn_0_fused/w: [num_experts, model_dim, 2 * expand_dim], gate first.
+    w1 = jnp.asarray(params['ffn_0_fused']['w'], self.activation_dtype)  # pyrefly: ignore[bad-index, unsupported-operation]
+    # ffn_1/w: [num_experts, expand_dim, model_dim]
+    w2 = jnp.asarray(params['ffn_1']['w'], self.activation_dtype)  # pyrefly: ignore[bad-index, unsupported-operation]
+    outputs = fused_ep_bridge.fused_ep_moe(
+        x, w1, w2, None, None, None,
+        top_k=top_k,
+        # The weights are this layer's softmax over the selected experts
+        # already; the kernel takes them as they are.
+        renormalize=False,
+        mesh=mesh,
+        expert_axis=ep_axis,
+        tile_rows=fused_ep_bridge.TILE_ROWS,
+        weight_format=fused_ep_bridge.weight_format('bf16'),
+        activation=self.ffn_activation,
+        routing=(indices, weights),
+        config=fused_ep_bridge.config_for(
+            hidden=model_dim,
+            inter=self.expand_dim,
+            experts_per_shard=self.num_experts // mesh.shape[ep_axis],
+            top_k=top_k,
+            rows=self.fused_ep_rows,
+            activation_block=self.fused_ep_activation_block,
+        ),
+    )
+    outputs = outputs.reshape(batch_size, seq_len, model_dim)
+    # The rows each expert received, over every token of the call: the same
+    # load the sparse path reports (padded tokens route to index num_experts
+    # and fall outside the count).
+    group_sizes = jnp.bincount(indices.reshape(-1), length=self.num_experts)
+    load = jnp.asarray(
+        group_sizes / jnp.sum(group_sizes), self.activation_dtype
+    )
+    return outputs, {'load': load}
 
   def _apply_sparse_moe(
       self,
@@ -2487,6 +2622,11 @@ class TransformerBlock(module.SimplyModule):
   # Weight-only quant for the MoE expert weights (fused '<dtype>[:<n_blocks>]'
   # spec, e.g. 'int8'/'int4:8'; empty disables). Propagated to MoEFeedForward.
   ffn_weight_quant: str = ''
+  # The MoE layer's expert-parallel method (MoEFeedForward.ep_method), and
+  # the fused kernel's row numerics under 'fused_ep' (inference only).
+  ep_method: str = 'ra2a'
+  fused_ep_rows: str = 'fp8'
+  fused_ep_activation_block: int = 0
   # For ragged paged attention.
   total_num_pages: int = 0
   page_size: int = 0
@@ -2613,6 +2753,9 @@ class TransformerBlock(module.SimplyModule):
           # Implementation of gmm.
           gmm_impl=self.gmm_impl,
           weight_quant=self.ffn_weight_quant,
+          ep_method=self.ep_method,
+          fused_ep_rows=self.fused_ep_rows,
+          fused_ep_activation_block=self.fused_ep_activation_block,
       )
     else:
       self.ffn = FeedForward(
@@ -2811,6 +2954,10 @@ class TransformerLM(module.SimplyModule):
           tile_expand_dim=config.tile_expand_dim,
           gmm_impl=config.gmm_impl,
           ffn_weight_quant=config.ffn_weight_quant,
+          ep_method=getattr(config, 'ep_method', 'ra2a'),
+          fused_ep_rows=getattr(config, 'fused_ep_rows', 'fp8'),
+          fused_ep_activation_block=getattr(
+              config, 'fused_ep_activation_block', 0),
           # Mixed precision related.
           activation_dtype=self.activation_dtype,
           sharding_config=sharding_config,
