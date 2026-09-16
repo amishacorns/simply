@@ -320,6 +320,22 @@ class BaseExperimentConfig(ExperimentConfig):
   tile_model_dim: int = 1024
   tile_expand_dim: int = 1024
   gmm_impl: str = 'ragged_dot'
+  # The MoE layer's expert-parallel method (model_lib.MoEFeedForward
+  # .ep_method): 'ra2a' (ragged all-to-all dispatch, grouped matmuls, ragged
+  # all-to-all combine) or 'fused_ep' (the whole layer through the fused
+  # expert-parallel kernel, simply/kernels/fused_ep_bridge.py, over the
+  # sharding config's expert-parallel axis; inference only).
+  ep_method: str = 'ra2a'
+  # With ep_method='fused_ep': the kernel's row numerics, 'fp8' (its default:
+  # the token rows, the intermediate and the result rows rounded to fp8 with
+  # a scale per row) or 'bf16' (nothing rounded past bfloat16, the rounding
+  # the ra2a path has).
+  fused_ep_rows: str = 'fp8'
+  # With ep_method='fused_ep': the column block an expert too large for the
+  # kernel's whole-expert build streams in (0 = whole-expert; 512 once the
+  # local experts' weights do not fit VMEM, e.g. Qwen3-235B's 4096 x 1536
+  # experts at 16 per shard).
+  fused_ep_activation_block: int = 0
   global_total_num_pages: int = 0
   local_total_num_pages: int = 0
   page_size: int = 0
@@ -2035,6 +2051,25 @@ def qwen3_30b_a3b_thinking_2507():
 
 
 @ExperimentConfigRegistry.register
+def qwen3_30b_a3b_fused_ep():
+  """Qwen3-30B-A3B, every MoE layer through the fused expert-parallel kernel."""
+  return dataclasses.replace(qwen3_30b_a3b(), ep_method='fused_ep')
+
+
+@ExperimentConfigRegistry.register
+def qwen3_30b_a3b_thinking_2507_fused_ep():
+  """The Thinking-2507 chat model, every MoE layer through the fused kernel."""
+  return dataclasses.replace(
+      qwen3_30b_a3b_thinking_2507(), ep_method='fused_ep')
+
+
+@ExperimentConfigRegistry.register
+def qwen3_30b_a3b_fused_ep_bf16():
+  """The fused-kernel config with bf16 rows: no rounding past bfloat16."""
+  return dataclasses.replace(qwen3_30b_a3b_fused_ep(), fused_ep_rows='bf16')
+
+
+@ExperimentConfigRegistry.register
 def qwen3_235b_a22b() -> BaseExperimentConfig:
   return dataclasses.replace(
       qwen3_30b_a3b(),
@@ -2044,6 +2079,17 @@ def qwen3_235b_a22b() -> BaseExperimentConfig:
       n_layers=94,
       init_ckpt_dir=QWEN3_235B_A22B_CKPT_DIR,
   )
+
+
+@ExperimentConfigRegistry.register
+def qwen3_235b_a22b_fused_ep() -> BaseExperimentConfig:
+  """Qwen3-235B-A22B, every MoE layer through the fused expert-parallel kernel.
+
+  The 4096 x 1536 experts, 16 per shard, do not fit the whole-expert build,
+  so the experts stream in 512-column blocks.
+  """
+  return dataclasses.replace(
+      qwen3_235b_a22b(), ep_method='fused_ep', fused_ep_activation_block=512)
 
 
 @ExperimentConfigRegistry.register
