@@ -169,6 +169,17 @@ class LegacyFormat(CheckpointFormat):
 
 @CheckpointFormatRegistry.register
 @dataclasses.dataclass(frozen=True)
+class PlainFormat(CheckpointFormat):
+  """A checkpoint stored as the model's own parameter tree.
+
+  Nothing is transformed at restore, so a large checkpoint costs one
+  placement and no transformed copy on the devices: the format for a
+  checkpoint converted offline.
+  """
+
+
+@CheckpointFormatRegistry.register
+@dataclasses.dataclass(frozen=True)
 class V2Format(CheckpointFormat):
   """Current format that modulizes a lot of model components."""
 
@@ -687,6 +698,53 @@ def construct_restore_item(
   return jax.tree_util.tree_unflatten(treedef, structs)
 
 
+def fuse_expert_gate_up(
+    state: PyTree, target_abstract_state: PyTree
+) -> PyTree:
+  """Builds each `ffn_0_fused/w` the target asks for from the stored halves.
+
+  The fused expert-parallel kernel's weight form (model_lib.MoEFeedForward
+  ._fuse_gate_and_up): `ffn_0_gate/w` and `ffn_0/w`, both
+  [num_experts, model_dim, expand_dim], side by side along the last axis,
+  gate first. A stored half the target does not ask for on its own is
+  dropped once fused. State the target asks nothing of this kind from
+  passes through untouched.
+
+  The fused array is built beside its two halves, a transient third copy of
+  a layer's expert weights on the devices. A checkpoint too large for that
+  is converted once, offline, into the model's own parameter tree and
+  restored as `PlainFormat`, which fuses nothing at restore.
+  """
+  flat_target = ocp.tree.to_flat_dict(target_abstract_state, sep='/')
+  flat_state = ocp.tree.to_flat_dict(state, sep='/')
+  fused_any = False
+  for key, abstract in flat_target.items():
+    m = re.fullmatch(r'(.*)/ffn_0_fused/w', key)
+    if not m or key in flat_state:
+      continue
+    gate_key, up_key = f'{m.group(1)}/ffn_0_gate/w', f'{m.group(1)}/ffn_0/w'
+    if gate_key not in flat_state or up_key not in flat_state:
+      continue  # the caller reports the leaf that stays abstract
+    fused = jnp.concatenate([flat_state[gate_key], flat_state[up_key]],
+                            axis=-1)
+    flat_state[key] = sharding_lib.with_sharding_constraint(
+        fused, abstract.sharding  # pyrefly: ignore[missing-attribute]
+    )
+    for source in (gate_key, up_key):
+      if source not in flat_target:
+        consumed = flat_state.pop(source)
+        if isinstance(consumed, jax.Array) and not isinstance(
+            consumed, jax.core.Tracer
+        ):
+          consumed.delete()  # the fused copy replaces it on the devices now
+    fused_any = True
+  if not fused_any:
+    return state
+  logging.info('fused the gate and up expert weights for the fused'
+               ' expert-parallel kernel')
+  return ocp.tree.from_flat_dict(flat_state, sep='/')
+
+
 def load_checkpoint_from_path(
     ckpt_path: str,
     abstract_state: PyTree,
@@ -737,6 +795,7 @@ def load_checkpoint_from_path(
     def transform_state_fn(stored_state: PyTree) -> PyTree:  # pylint: disable=function-redefined
 
       state = ckpt_format.transforms(stored_state, target_abstract_state)
+      state = fuse_expert_gate_up(state, target_abstract_state)
 
       def _get_regularized_value(
           path: jax.tree_util.KeyPath,
