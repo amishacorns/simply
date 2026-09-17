@@ -1069,9 +1069,9 @@ class MoEFeedForward(FeedForward):
     x = sharding_lib.with_sharding_constraint(x, row_partition)
     indices = selected_indices.reshape(tokens, top_k).astype(jnp.int32)
     indices = sharding_lib.with_sharding_constraint(indices, row_partition)
-    # The router's probabilities stay float32 into the kernel, which combines
-    # in float32; rounding them to the activation dtype first would cost
-    # accuracy for nothing.
+    # `apply` has already rounded the router's probabilities to the activation
+    # dtype, the same values the other paths combine with; the kernel takes
+    # them as float32 because it combines in float32.
     weights = jnp.asarray(selected_weights, jnp.float32).reshape(tokens, top_k)
     weights = sharding_lib.with_sharding_constraint(weights, row_partition)
     # ffn_0_fused/w: [num_experts, model_dim, 2 * expand_dim], gate first.
